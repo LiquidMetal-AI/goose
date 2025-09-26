@@ -37,6 +37,7 @@ use input::InputResult;
 use rmcp::model::PromptMessage;
 use rmcp::model::ServerNotification;
 use rmcp::model::{ErrorCode, ErrorData};
+use url;
 
 use goose::conversation::message::{Message, MessageContent};
 use rand::{distributions::Alphanumeric, Rng};
@@ -230,11 +231,28 @@ impl Session {
     /// # Arguments
     /// * `extension_url` - URL of the server
     pub async fn add_remote_extension(&mut self, extension_url: String) -> Result<()> {
-        let name: String = rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(8)
-            .map(char::from)
-            .collect();
+        // Create a deterministic name based on the URL so OAuth credentials can be found consistently
+        let name = if let Ok(url) = url::Url::parse(&extension_url) {
+            // Use the host name or create a hash-based name for consistency
+            if let Some(host) = url.host_str() {
+                // Clean the host name to make it a valid identifier
+                host.replace('.', "-").replace(':', "_")
+            } else {
+                // Fallback to hash-based name
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                extension_url.hash(&mut hasher);
+                format!("ext_{:x}", hasher.finish())
+            }
+        } else {
+            // If URL parsing fails, use hash-based name
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            extension_url.hash(&mut hasher);
+            format!("ext_{:x}", hasher.finish())
+        };
 
         let config = ExtensionConfig::Sse {
             name,
@@ -264,11 +282,29 @@ impl Session {
     /// # Arguments
     /// * `extension_url` - URL of the server
     pub async fn add_streamable_http_extension(&mut self, extension_url: String) -> Result<()> {
-        let name: String = rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(8)
-            .map(char::from)
-            .collect();
+        // Create a deterministic name based on the URL so OAuth credentials can be found consistently
+        let name = if let Ok(url) = url::Url::parse(&extension_url) {
+            // Use the host name or create a hash-based name for consistency
+            if let Some(host) = url.host_str() {
+                // Clean the host name to make it a valid identifier
+                host.replace('.', "-").replace(':', "_")
+            } else {
+                // Fallback to hash-based name
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                extension_url.hash(&mut hasher);
+                format!("ext_{:x}", hasher.finish())
+            }
+        } else {
+            // If URL parsing fails, fall back to the original random approach
+            let name: String = rand::thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(8)
+                .map(char::from)
+                .collect();
+            name
+        };
 
         let config = ExtensionConfig::StreamableHttp {
             name,

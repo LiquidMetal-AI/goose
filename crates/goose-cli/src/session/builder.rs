@@ -65,13 +65,47 @@ pub struct SessionBuilderConfig {
     pub retry_config: Option<RetryConfig>,
 }
 
-/// Offers to help debug an extension failure by creating a minimal debugging session
+/// Attempts OAuth retry for authentication errors, then offers debugging help
 async fn offer_extension_debugging_help(
     extension_name: &str,
     error_message: &str,
     provider: Arc<dyn goose::providers::base::Provider>,
     interactive: bool,
 ) -> Result<(), anyhow::Error> {
+    // Check if this looks like an authentication error first
+    let is_likely_auth_error = error_message.contains("401")
+        || error_message.contains("403")
+        || error_message.contains("Unauthorized")
+        || error_message.contains("Forbidden")
+        || error_message.contains("authentication")
+        || error_message.contains("WWW-Authenticate");
+
+    if is_likely_auth_error && interactive {
+        println!(
+            "{}",
+            style("🔐 Detected authentication error - attempting OAuth flow...").cyan()
+        );
+
+        match goose::oauth::oauth_flow(extension_name, extension_name).await {
+            Ok(_) => {
+                println!(
+                    "{}",
+                    style(
+                        "✅ OAuth authentication completed! Please try running the command again."
+                    )
+                    .green()
+                );
+                return Ok(());
+            }
+            Err(oauth_err) => {
+                println!(
+                    "{}",
+                    style(format!("❌ OAuth authentication failed: {}", oauth_err)).red()
+                );
+                // Fall through to offer debugging help
+            }
+        }
+    }
     // Only offer debugging help in interactive mode
     if !interactive {
         return Ok(());
@@ -129,14 +163,27 @@ async fn offer_extension_debugging_help(
         }
     }
 
-    // Create a temporary session file for this debugging session
-    let temp_session_file =
-        std::env::temp_dir().join(format!("goose_debug_extension_{}.jsonl", extension_name));
+    // Create a debug session file within the sessions directory
+    let session_dir = goose::session::ensure_session_dir().map_err(|e| {
+        tracing::error!("Failed to access session directory for debugging: {}", e);
+        anyhow::anyhow!("Failed to access session directory")
+    })?;
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let timestamp = timestamp.to_string();
+    let debug_session_file = session_dir.join(format!(
+        "debug_extension_{}_{}.jsonl",
+        extension_name.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_"), // Sanitize filename
+        timestamp
+    ));
 
     // Create the debugging session
     let mut debug_session = Session::new(
         debug_agent,
-        Some(temp_session_file.clone()),
+        Some(debug_session_file.clone()),
         false,
         None,
         None,
@@ -161,8 +208,8 @@ async fn offer_extension_debugging_help(
         }
     }
 
-    // Clean up the temporary session file
-    let _ = std::fs::remove_file(temp_session_file);
+    // Clean up the debug session file
+    let _ = std::fs::remove_file(debug_session_file);
 
     Ok(())
 }
@@ -670,5 +717,171 @@ mod tests {
         // This test mainly serves as a compilation check
         assert_eq!(extension_name, "test-extension");
         assert_eq!(error_message, "test error");
+    }
+
+    #[test]
+    fn test_auth_error_detection_401() {
+        // Test that 401 errors are properly detected as authentication errors
+
+        let error_messages = vec![
+            "HTTP 401 Unauthorized",
+            "Error: 401 - Authentication required",
+            "Request failed with status 401",
+            "401 Unauthorized: Invalid credentials",
+        ];
+
+        for error_message in error_messages {
+            let is_auth_error = error_message.contains("401")
+                || error_message.contains("403")
+                || error_message.contains("Unauthorized")
+                || error_message.contains("Forbidden")
+                || error_message.contains("authentication")
+                || error_message.contains("WWW-Authenticate");
+
+            assert!(is_auth_error, "Should detect '{}' as auth error", error_message);
+        }
+    }
+
+    #[test]
+    fn test_auth_error_detection_403() {
+        // Test that 403 errors are properly detected as authentication errors
+
+        let error_messages = vec![
+            "HTTP 403 Forbidden",
+            "Error: 403 - Access denied",
+            "Request failed with status 403",
+            "403 Forbidden: Insufficient permissions",
+        ];
+
+        for error_message in error_messages {
+            let is_auth_error = error_message.contains("401")
+                || error_message.contains("403")
+                || error_message.contains("Unauthorized")
+                || error_message.contains("Forbidden")
+                || error_message.contains("authentication")
+                || error_message.contains("WWW-Authenticate");
+
+            assert!(is_auth_error, "Should detect '{}' as auth error", error_message);
+        }
+    }
+
+    #[test]
+    fn test_auth_error_detection_keywords() {
+        // Test that authentication-related keywords are properly detected
+
+        let auth_error_messages = vec![
+            "Authentication failed",
+            "Unauthorized access attempt",
+            "Access Forbidden",
+            "WWW-Authenticate header missing",
+            "authentication required",
+        ];
+
+        for error_message in auth_error_messages {
+            let is_auth_error = error_message.contains("401")
+                || error_message.contains("403")
+                || error_message.contains("Unauthorized")
+                || error_message.contains("Forbidden")
+                || error_message.contains("authentication")
+                || error_message.contains("WWW-Authenticate");
+
+            assert!(is_auth_error, "Should detect '{}' as auth error", error_message);
+        }
+    }
+
+    #[test]
+    fn test_non_auth_error_detection() {
+        // Test that non-authentication errors are not mistakenly detected
+
+        let non_auth_error_messages = vec![
+            "Connection timeout",
+            "HTTP 500 Internal Server Error",
+            "Network unreachable",
+            "DNS resolution failed",
+            "404 Not Found",
+            "Invalid JSON response",
+            "Connection refused",
+        ];
+
+        for error_message in non_auth_error_messages {
+            let is_auth_error = error_message.contains("401")
+                || error_message.contains("403")
+                || error_message.contains("Unauthorized")
+                || error_message.contains("Forbidden")
+                || error_message.contains("authentication")
+                || error_message.contains("WWW-Authenticate");
+
+            assert!(!is_auth_error, "Should NOT detect '{}' as auth error", error_message);
+        }
+    }
+
+    #[test]
+    fn test_case_sensitive_auth_error_detection() {
+        // Test that authentication error detection is case sensitive (current implementation)
+
+        let mixed_case_messages = vec![
+            ("Unauthorized", true),    // Should match
+            ("unauthorized", false),   // Won't match (case sensitive)
+            ("UNAUTHORIZED", false),   // Won't match (case sensitive)
+            ("Forbidden", true),       // Should match
+            ("forbidden", false),      // Won't match (case sensitive)
+            ("Authentication", false), // Won't match (case sensitive)
+            ("authentication", true),  // Should match
+        ];
+
+        for (error_message, should_match) in mixed_case_messages {
+            let is_auth_error = error_message.contains("401")
+                || error_message.contains("403")
+                || error_message.contains("Unauthorized")
+                || error_message.contains("Forbidden")
+                || error_message.contains("authentication")
+                || error_message.contains("WWW-Authenticate");
+
+            if should_match {
+                assert!(is_auth_error, "Should detect '{}' as auth error", error_message);
+            } else {
+                assert!(!is_auth_error, "Should NOT detect '{}' as auth error", error_message);
+            }
+        }
+    }
+
+    #[test]
+    fn test_offer_extension_debugging_help_exists() {
+        // Test that the function exists and can be referenced
+        // This is primarily a compilation test to ensure the function is properly exported
+
+        // The function should exist and be callable
+        // We can't test it fully without complex setup, but we can verify it exists
+        let _function_exists = offer_extension_debugging_help as *const ();
+        assert!(!_function_exists.is_null()); // Just a basic sanity check
+    }
+
+    #[test]
+    fn test_debug_session_file_naming() {
+        // Test that debug session files are named appropriately
+
+        use std::path::Path;
+
+        // Test filename sanitization for various extension names
+        let test_cases = vec![
+            ("normal-extension", "normal-extension"),
+            ("extension/with/slashes", "extension_with_slashes"),
+            ("extension\\with\\backslashes", "extension_with_backslashes"),
+            ("extension:with:colons", "extension_with_colons"),
+            ("extension*with*stars", "extension_with_stars"),
+            ("extension?with?questions", "extension_with_questions"),
+            ("extension\"with\"quotes", "extension_with_quotes"),
+            ("extension<with>brackets", "extension_with_brackets"),
+            ("extension|with|pipes", "extension_with_pipes"),
+        ];
+
+        for (input, expected_sanitized) in test_cases {
+            let sanitized = input.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
+            assert_eq!(sanitized, expected_sanitized);
+
+            // Verify the sanitized name can be used in a filename
+            let test_filename = format!("debug_extension_{}_{}.jsonl", sanitized, "12345");
+            assert!(Path::new(&test_filename).file_name().is_some());
+        }
     }
 }

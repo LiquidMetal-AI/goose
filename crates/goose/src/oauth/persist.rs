@@ -46,8 +46,15 @@ async fn load_credentials(
 
 pub fn clear_credentials(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::global();
+    let key = secret_key(name);
 
-    Ok(config.delete_secret(&secret_key(name))?)
+    match config.delete_secret(&key) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::warn!("Failed to clear OAuth credentials for '{}': {}", name, e);
+            Err(e.into())
+        }
+    }
 }
 
 pub async fn load_cached_state<U: IntoUrl>(

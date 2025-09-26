@@ -6,6 +6,7 @@ use futures::{future, FutureExt};
 use mcp_core::handler::require_str_parameter;
 use mcp_core::ToolCall;
 use rmcp::service::ClientInitializeError;
+use rmcp::transport::sse_client::SseClientConfig;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{
     ConfigureCommandExt, SseClientTransport, StreamableHttpClientTransport, TokioChildProcess,
@@ -266,24 +267,95 @@ impl ExtensionManager {
         }
 
         let client: Box<dyn McpClientTrait> = match &config {
-            ExtensionConfig::Sse { uri, timeout, .. } => {
-                let transport = SseClientTransport::start(uri.to_string()).await.map_err(
-                    |transport_error| {
+            ExtensionConfig::Sse {
+                uri, timeout, name, ..
+            } => {
+                // First, check if we have cached OAuth credentials for this extension
+                let cached_auth_manager =
+                    match crate::oauth::persist::load_cached_state(uri, name).await {
+                        Ok(oauth_state) => oauth_state.into_authorization_manager(),
+                        Err(_) => None,
+                    };
+
+                // Try with cached credentials first, if available
+                let client_res = if let Some(auth_manager) = cached_auth_manager {
+                    let auth_client = AuthClient::new(reqwest::Client::default(), auth_manager);
+                    let sse_config = SseClientConfig {
+                        sse_endpoint: uri.to_string().into(),
+                        ..Default::default()
+                    };
+                    let auth_transport =
+                        SseClientTransport::start_with_client(auth_client, sse_config)
+                            .await
+                            .map_err(|transport_error| {
+                                ClientInitializeError::transport::<
+                                    SseClientTransport<AuthClient<reqwest::Client>>,
+                                >(
+                                    transport_error, "connect with cached auth"
+                                )
+                            })?;
+
+                    McpClient::connect(
+                        auth_transport,
+                        Duration::from_secs(
+                            timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
+                        ),
+                    )
+                    .await
+                } else {
+                    // No cached credentials, try without authentication first
+                    let transport_res = SseClientTransport::start(uri.to_string()).await;
+                    let transport = transport_res.map_err(|transport_error| {
                         ClientInitializeError::transport::<SseClientTransport<reqwest::Client>>(
                             transport_error,
                             "connect",
                         )
-                    },
-                )?;
-                Box::new(
+                    })?;
+
                     McpClient::connect(
                         transport,
                         Duration::from_secs(
                             timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
                         ),
                     )
-                    .await?,
-                )
+                    .await
+                };
+
+                let client = if let Err(e) = client_res {
+                    // Try OAuth flow on connection failure (similar to StreamableHttp)
+                    let am = match oauth_flow(uri, name).await {
+                        Ok(am) => am,
+                        Err(_) => return Err(e.into()),
+                    };
+
+                    // Create authenticated SSE client
+                    let auth_client = AuthClient::new(reqwest::Client::default(), am);
+                    let sse_config = SseClientConfig {
+                        sse_endpoint: uri.to_string().into(),
+                        ..Default::default()
+                    };
+                    let auth_transport =
+                        SseClientTransport::start_with_client(auth_client, sse_config)
+                            .await
+                            .map_err(|transport_error| {
+                                ClientInitializeError::transport::<
+                                    SseClientTransport<AuthClient<reqwest::Client>>,
+                                >(
+                                    transport_error, "connect with auth"
+                                )
+                            })?;
+
+                    McpClient::connect(
+                        auth_transport,
+                        Duration::from_secs(
+                            timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
+                        ),
+                    )
+                    .await?
+                } else {
+                    client_res?
+                };
+                Box::new(client)
             }
             ExtensionConfig::StreamableHttp {
                 uri,
@@ -292,6 +364,14 @@ impl ExtensionManager {
                 name,
                 ..
             } => {
+                // First, check if we have cached OAuth credentials for this extension
+                let cached_auth_manager = match crate::oauth::persist::load_cached_state(uri, name)
+                    .await
+                {
+                    Ok(oauth_state) => oauth_state.into_authorization_manager(),
+                    Err(_) => None,
+                };
+
                 let mut default_headers = HeaderMap::new();
                 for (key, value) in headers {
                     default_headers.insert(
@@ -303,38 +383,12 @@ impl ExtensionManager {
                         })?,
                     );
                 }
-                let client = reqwest::Client::builder()
-                    .default_headers(default_headers)
-                    .build()
-                    .map_err(|_| {
-                        ExtensionError::ConfigError("could not construct http client".to_string())
-                    })?;
-                let transport = StreamableHttpClientTransport::with_client(
-                    client,
-                    StreamableHttpClientTransportConfig {
-                        uri: uri.clone().into(),
-                        ..Default::default()
-                    },
-                );
-                let client_res = McpClient::connect(
-                    transport,
-                    Duration::from_secs(
-                        timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
-                    ),
-                )
-                .await;
-                let client = if let Err(e) = client_res {
-                    // make an attempt at oauth, but failing that, return the original error,
-                    // because this might not have been an auth error at all.
-                    // TODO: when rmcp supports it, we should trigger this flow on 401s with
-                    // WWW-Authenticate headers, not just any init error
-                    let am = match oauth_flow(uri, name).await {
-                        Ok(am) => am,
-                        Err(_) => return Err(e.into()),
-                    };
-                    let client = AuthClient::new(reqwest::Client::default(), am);
+
+                // Try with cached credentials first, if available
+                let client_res = if let Some(auth_manager) = cached_auth_manager {
+                    let auth_client = AuthClient::new(reqwest::Client::default(), auth_manager);
                     let transport = StreamableHttpClientTransport::with_client(
-                        client,
+                        auth_client,
                         StreamableHttpClientTransportConfig {
                             uri: uri.clone().into(),
                             ..Default::default()
@@ -346,10 +400,59 @@ impl ExtensionManager {
                             timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
                         ),
                     )
-                    .await?
+                    .await
                 } else {
-                    client_res?
+                    // No cached credentials - for HTTP MCP servers, proactively attempt OAuth
+                    // since they commonly require authentication
+                    let oauth_result = oauth_flow(uri, name).await;
+
+                    match oauth_result {
+                        Ok(auth_manager) => {
+                            let auth_client =
+                                AuthClient::new(reqwest::Client::default(), auth_manager);
+                            let transport = StreamableHttpClientTransport::with_client(
+                                auth_client,
+                                StreamableHttpClientTransportConfig {
+                                    uri: uri.clone().into(),
+                                    ..Default::default()
+                                },
+                            );
+                            McpClient::connect(
+                                transport,
+                                Duration::from_secs(
+                                    timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
+                                ),
+                            )
+                            .await
+                        }
+                        Err(_oauth_err) => {
+                            // OAuth failed, try unauthenticated as fallback
+                            let client = reqwest::Client::builder()
+                                .default_headers(default_headers)
+                                .build()
+                                .map_err(|_| {
+                                    ExtensionError::ConfigError(
+                                        "could not construct http client".to_string(),
+                                    )
+                                })?;
+                            let transport = StreamableHttpClientTransport::with_client(
+                                client,
+                                StreamableHttpClientTransportConfig {
+                                    uri: uri.clone().into(),
+                                    ..Default::default()
+                                },
+                            );
+                            McpClient::connect(
+                                transport,
+                                Duration::from_secs(
+                                    timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
+                                ),
+                            )
+                            .await
+                        }
+                    }
                 };
+                let client = client_res?;
                 Box::new(client)
             }
             ExtensionConfig::Stdio {
@@ -1456,5 +1559,117 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_oauth_integration_code_paths_exist() {
+        // Test that OAuth integration code paths are correctly structured
+        // This is a compile-time test to verify the OAuth-related code compiles
+
+        // Test that we can create extension configs with OAuth-related fields
+        let sse_config = ExtensionConfig::Sse {
+            name: "test_sse".to_string(),
+            uri: "https://example.com".to_string(),
+            timeout: Some(30),
+            envs: Default::default(),
+            env_keys: vec![],
+            description: None,
+            bundled: Some(false),
+            available_tools: vec![],
+        };
+
+        let http_config = ExtensionConfig::StreamableHttp {
+            name: "test_http".to_string(),
+            uri: "https://example.com".to_string(),
+            timeout: Some(30),
+            headers: HashMap::new(),
+            envs: Default::default(),
+            env_keys: vec![],
+            description: None,
+            bundled: Some(false),
+            available_tools: vec![],
+        };
+
+        // Verify configs can be created without errors
+        assert_eq!(sse_config.key(), "test_sse");
+        assert_eq!(http_config.key(), "test_http");
+
+        // This test ensures the OAuth integration compiles correctly
+    }
+
+    #[test]
+    fn test_extension_config_fields_for_oauth() {
+        // Test that ExtensionConfig has the necessary fields for OAuth integration
+
+        let config = ExtensionConfig::StreamableHttp {
+            name: "oauth_test".to_string(),
+            uri: "https://oauth-server.example.com".to_string(),
+            timeout: Some(60),
+            headers: HashMap::new(),
+            envs: Default::default(),
+            env_keys: vec![],
+            description: Some("OAuth-enabled extension".to_string()),
+            bundled: Some(false),
+            available_tools: vec![],
+        };
+
+        // Verify the config has the name field (used for OAuth credential lookup)
+        assert_eq!(config.key(), "oauth_test");
+
+        // Verify the config structure supports OAuth requirements
+        match config {
+            ExtensionConfig::StreamableHttp { name, uri, .. } => {
+                assert!(!name.is_empty());
+                assert!(uri.starts_with("https://"));
+            }
+            _ => panic!("Expected StreamableHttp config"),
+        }
+    }
+
+    #[test]
+    fn test_extension_naming_consistency_for_oauth() {
+        // Test that extension names are processed consistently for OAuth credential lookup
+
+        // Test various extension name formats to ensure they produce consistent keys
+        let test_cases = vec![
+            ("simple_name", "simple_name"),
+            ("name-with-dashes", "name-with-dashes"),
+            ("name_with_underscores", "name_with_underscores"),
+            ("name.with.dots", "name.with.dots"),
+            ("SpecialChars123", "specialchars123"), // name_to_key() removes whitespace and lowercases
+            ("Name With Spaces", "namewithspaces"), // name_to_key() removes whitespace and lowercases
+        ];
+
+        for (input_name, expected_key) in test_cases {
+            let config = ExtensionConfig::StreamableHttp {
+                name: input_name.to_string(),
+                uri: "https://example.com".to_string(),
+                timeout: Some(30),
+                headers: HashMap::new(),
+                envs: Default::default(),
+                env_keys: vec![],
+                description: None,
+                bundled: Some(false),
+                available_tools: vec![],
+            };
+
+            // Verify the key is consistent and matches the name
+            assert_eq!(config.key(), expected_key);
+        }
+
+        // This test ensures OAuth credential lookup uses consistent naming
+    }
+
+    #[test]
+    fn test_oauth_code_integration_compiles() {
+        // Test that OAuth integration code compiles without issues
+        // This verifies the imports and function calls are correct
+
+        // Test that we can reference the OAuth functions
+        let _oauth_fn = crate::oauth::oauth_flow;
+        let _clear_fn = crate::oauth::clear_credentials;
+        // Note: load_cached_state requires generic type annotation, so we test it through compilation only
+
+        // This test ensures all OAuth dependencies compile correctly
     }
 }

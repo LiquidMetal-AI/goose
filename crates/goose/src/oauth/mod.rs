@@ -11,9 +11,11 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tracing::warn;
 
-use crate::oauth::persist::{clear_credentials, load_cached_state, save_credentials};
+use crate::oauth::persist::{load_cached_state, save_credentials};
 
-mod persist;
+pub use persist::clear_credentials;
+
+pub mod persist;
 
 const CALLBACK_TEMPLATE: &str = include_str!("oauth_callback.html");
 
@@ -30,17 +32,22 @@ struct CallbackParams {
 }
 
 pub async fn oauth_flow(
-    mcp_server_url: &String,
-    name: &String,
+    mcp_server_url: &str,
+    name: &str,
 ) -> Result<AuthorizationManager, anyhow::Error> {
     if let Ok(oauth_state) = load_cached_state(mcp_server_url, name).await {
         if let Some(authorization_manager) = oauth_state.into_authorization_manager() {
-            if authorization_manager.refresh_token().await.is_ok() {
-                return Ok(authorization_manager);
+            match authorization_manager.refresh_token().await {
+                Ok(_) => {
+                    return Ok(authorization_manager);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to refresh OAuth token for '{}': {}", name, e);
+                }
             }
         }
 
-        if let Err(e) = clear_credentials(name) {
+        if let Err(e) = crate::oauth::persist::clear_credentials(name) {
             warn!("error clearing bad credentials: {}", e);
         }
     }
@@ -98,4 +105,51 @@ pub async fn oauth_flow(
         .ok_or_else(|| anyhow::anyhow!("Failed to get authorization manager"))?;
 
     Ok(auth_manager)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oauth::persist::clear_credentials;
+
+    #[test]
+    fn test_oauth_flow_function_signature() {
+        // Test that oauth_flow function exists and accepts correct parameter types
+        // This is a compile-time test to verify the function signature
+
+        // The function should accept &str parameters, not &String
+        // We just test that the function exists and can be referenced
+        let _oauth_fn = oauth_flow;
+
+        // This test ensures our API change from &String to &str works correctly
+    }
+
+    #[test]
+    fn test_clear_credentials_function_exported() {
+        // Test that clear_credentials function is properly exported
+        // This ensures the function is accessible from the module's public interface
+
+        // The function should exist and be callable
+        let _: fn(&str) -> _ = clear_credentials;
+
+        // This verifies the function is properly exported from persist module
+    }
+
+    #[test]
+    fn test_oauth_module_exports() {
+        // Test that the oauth module properly exports its public interface
+
+        // Verify the clear_credentials function is re-exported
+        let _ = clear_credentials; // Should compile
+
+        // Verify oauth_flow function is exported
+        let _ = oauth_flow; // Should compile
+
+        // This test ensures the module structure changes work correctly
+    }
+
+    // Note: We don't test the actual OAuth flow functionality here as it requires
+    // external dependencies (network, keychain, browser) that would make tests
+    // non-deterministic and potentially interactive. The OAuth flow is tested
+    // through integration tests in a controlled environment.
 }

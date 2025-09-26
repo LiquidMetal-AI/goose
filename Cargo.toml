@@ -14,9 +14,8 @@ description = "An AI agent"
 uninlined_format_args = "allow"
 
 [workspace.dependencies]
-rmcp = { version = "0.6.2", features = ["schemars", "auth"] }
+rmcp = { version = "0.7.0", features = ["schemars", "auth"] }
 
 # Patch for Windows cross-compilation issue with crunchy
 [patch.crates-io]
 crunchy = { git = "https://github.com/nmathewson/crunchy", branch = "cross-compilation-fix" }
-rmcp = { path = "./patches/rmcp-0.6.2" }

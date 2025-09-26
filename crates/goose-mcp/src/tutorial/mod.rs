@@ -113,6 +113,9 @@ impl ServerHandler for TutorialServer {
             server_info: Implementation {
                 name: "goose-tutorial".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
+                title: Some("Goose Tutorial".to_string()),
+                website_url: None,
+                icons: None,
             },
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             instructions: Some(self.instructions.clone()),

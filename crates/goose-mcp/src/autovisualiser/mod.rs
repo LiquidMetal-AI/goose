@@ -409,6 +409,9 @@ impl ServerHandler for AutoVisualiserRouter {
             server_info: Implementation {
                 name: "goose-autovisualiser".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
+                title: Some("Goose Autovisualiser".to_string()),
+                website_url: None,
+                icons: None,
             },
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             instructions: Some(self.instructions.clone()),

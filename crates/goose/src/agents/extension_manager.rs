@@ -648,6 +648,8 @@ impl ExtensionManager {
                                 input_schema: tool.input_schema,
                                 annotations: tool.annotations,
                                 output_schema: tool.output_schema,
+                                title: tool.title,
+                                icons: tool.icons,
                             });
                         }
                     }

@@ -21,7 +21,7 @@ const CALLBACK_TEMPLATE: &str = include_str!("oauth_callback.html");
 
 #[derive(Clone)]
 struct AppState {
-    code_receiver: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    code_receiver: Arc<Mutex<Option<oneshot::Sender<(String, Option<String>)>>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,7 +52,7 @@ pub async fn oauth_flow(
         }
     }
 
-    let (code_sender, code_receiver) = oneshot::channel::<String>();
+    let (code_sender, code_receiver) = oneshot::channel::<(String, Option<String>)>();
     let app_state = AppState {
         code_receiver: Arc::new(Mutex::new(Some(code_sender))),
     };
@@ -62,7 +62,7 @@ pub async fn oauth_flow(
         let rendered = rendered.clone();
         async move {
             if let Some(sender) = state.code_receiver.lock().await.take() {
-                let _ = sender.send(params.code);
+                let _ = sender.send((params.code, params.state));
             }
             Html(rendered)
         }
@@ -93,8 +93,9 @@ pub async fn oauth_flow(
         eprintln!("  {}", authorization_url);
     }
 
-    let auth_code = code_receiver.await?;
-    oauth_state.handle_callback(&auth_code).await?;
+    let (auth_code, csrf_state) = code_receiver.await?;
+    let csrf_token = csrf_state.as_deref().unwrap_or("");
+    oauth_state.handle_callback(&auth_code, csrf_token).await?;
 
     if let Err(e) = save_credentials(name, &oauth_state).await {
         warn!("Failed to save credentials: {}", e);

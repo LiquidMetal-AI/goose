@@ -150,6 +150,7 @@ fn load_prompt_files() -> HashMap<String, Prompt> {
                 name: arg.name,
                 description: arg.description,
                 required: arg.required,
+                title: None,
             })
             .collect::<Vec<PromptArgument>>();
 
@@ -377,6 +378,9 @@ impl ServerHandler for DeveloperServer {
             server_info: Implementation {
                 name: "goose-developer".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
+                title: Some("Goose Developer".to_string()),
+                website_url: None,
+                icons: None,
             },
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
@@ -575,8 +579,10 @@ impl DeveloperServer {
             )
         })?;
 
-        let window_titles: Vec<String> =
-            windows.into_iter().map(|w| w.title().to_string()).collect();
+        let window_titles: Vec<String> = windows
+            .into_iter()
+            .filter_map(|w| w.title().ok())
+            .collect();
 
         let content_text = format!("Available windows:\n{}", window_titles.join("\n"));
 
@@ -616,7 +622,7 @@ impl DeveloperServer {
 
             let window = windows
                 .into_iter()
-                .find(|w| w.title() == window_title)
+                .find(|w| w.title().ok().as_deref() == Some(window_title))
                 .ok_or_else(|| {
                     ErrorData::new(
                         ErrorCode::INTERNAL_ERROR,

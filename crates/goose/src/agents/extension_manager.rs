@@ -28,7 +28,7 @@ use super::tool_execution::ToolCallResult;
 use crate::agents::extension::{Envs, ProcessExit};
 use crate::agents::extension_malware_check;
 use crate::config::{Config, ExtensionConfigManager};
-use crate::oauth::oauth_flow;
+use crate::oauth::{oauth_flow, persist::load_cached_state};
 use crate::prompt_template;
 use mcp_client::client::{McpClient, McpClientTrait};
 use rmcp::model::{
@@ -292,6 +292,15 @@ impl ExtensionManager {
                 name,
                 ..
             } => {
+                // Check if cached OAuth credentials exist, otherwise attempt OAuth flow
+                let use_oauth = match load_cached_state(uri, name).await {
+                    Ok(oauth_state) => oauth_state.into_authorization_manager().is_some(),
+                    Err(_) => {
+                        // No cached credentials, try OAuth flow
+                        oauth_flow(uri, name).await.is_ok()
+                    }
+                };
+
                 let mut default_headers = HeaderMap::new();
                 for (key, value) in headers {
                     default_headers.insert(
@@ -303,36 +312,41 @@ impl ExtensionManager {
                         })?,
                     );
                 }
-                let client = reqwest::Client::builder()
-                    .default_headers(default_headers)
-                    .build()
-                    .map_err(|_| {
-                        ExtensionError::ConfigError("could not construct http client".to_string())
+
+                // Now connect with or without auth based on what we determined
+                let client: Box<dyn McpClientTrait> = if use_oauth {
+                    // Load the OAuth state again and use it
+                    let oauth_state = load_cached_state(uri, name).await.map_err(|e| {
+                        ExtensionError::ConfigError(format!("Failed to load OAuth credentials: {}", e))
                     })?;
-                let transport = StreamableHttpClientTransport::with_client(
-                    client,
-                    StreamableHttpClientTransportConfig {
-                        uri: uri.clone().into(),
-                        ..Default::default()
-                    },
-                );
-                let client_res = McpClient::connect(
-                    transport,
-                    Duration::from_secs(
-                        timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
-                    ),
-                )
-                .await;
-                let client = if let Err(e) = client_res {
-                    // make an attempt at oauth, but failing that, return the original error,
-                    // because this might not have been an auth error at all.
-                    // TODO: when rmcp supports it, we should trigger this flow on 401s with
-                    // WWW-Authenticate headers, not just any init error
-                    let am = match oauth_flow(uri, name).await {
-                        Ok(am) => am,
-                        Err(_) => return Err(e.into()),
-                    };
-                    let client = AuthClient::new(reqwest::Client::default(), am);
+                    let am = oauth_state.into_authorization_manager().ok_or_else(|| {
+                        ExtensionError::ConfigError("OAuth state has no authorization manager".to_string())
+                    })?;
+                    let auth_client = AuthClient::new(reqwest::Client::default(), am);
+                    let transport = StreamableHttpClientTransport::with_client(
+                        auth_client,
+                        StreamableHttpClientTransportConfig {
+                            uri: uri.clone().into(),
+                            ..Default::default()
+                        },
+                    );
+                    Box::new(
+                        McpClient::connect(
+                            transport,
+                            Duration::from_secs(
+                                timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
+                            ),
+                        )
+                        .await?,
+                    )
+                } else {
+                    // Try without auth
+                    let client = reqwest::Client::builder()
+                        .default_headers(default_headers)
+                        .build()
+                        .map_err(|_| {
+                            ExtensionError::ConfigError("could not construct http client".to_string())
+                        })?;
                     let transport = StreamableHttpClientTransport::with_client(
                         client,
                         StreamableHttpClientTransportConfig {
@@ -340,17 +354,17 @@ impl ExtensionManager {
                             ..Default::default()
                         },
                     );
-                    McpClient::connect(
-                        transport,
-                        Duration::from_secs(
-                            timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
-                        ),
+                    Box::new(
+                        McpClient::connect(
+                            transport,
+                            Duration::from_secs(
+                                timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
+                            ),
+                        )
+                        .await?,
                     )
-                    .await?
-                } else {
-                    client_res?
                 };
-                Box::new(client)
+                client
             }
             ExtensionConfig::Stdio {
                 cmd,

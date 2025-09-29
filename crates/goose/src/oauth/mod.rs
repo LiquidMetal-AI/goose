@@ -13,7 +13,7 @@ use tracing::warn;
 
 use crate::oauth::persist::{clear_credentials, load_cached_state, save_credentials};
 
-mod persist;
+pub mod persist;
 
 const CALLBACK_TEMPLATE: &str = include_str!("oauth_callback.html");
 

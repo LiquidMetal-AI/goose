@@ -5730,8 +5730,6 @@ dependencies = [
 [[package]]
 name = "rmcp"
 version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "817ef98583b16628962dd8214ee89e9a9df6a79de9b487eb29ceddb1f610a7f6"
 dependencies = [
  "base64 0.22.1",
  "chrono",

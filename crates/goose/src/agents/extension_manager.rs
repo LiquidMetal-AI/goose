@@ -292,15 +292,6 @@ impl ExtensionManager {
                 name,
                 ..
             } => {
-                // Check if cached OAuth credentials exist, otherwise attempt OAuth flow
-                let use_oauth = match load_cached_state(uri, name).await {
-                    Ok(oauth_state) => oauth_state.into_authorization_manager().is_some(),
-                    Err(_) => {
-                        // No cached credentials, try OAuth flow
-                        oauth_flow(uri, name).await.is_ok()
-                    }
-                };
-
                 let mut default_headers = HeaderMap::new();
                 for (key, value) in headers {
                     default_headers.insert(
@@ -313,15 +304,100 @@ impl ExtensionManager {
                     );
                 }
 
-                // Now connect with or without auth based on what we determined
-                let client: Box<dyn McpClientTrait> = if use_oauth {
-                    // Load the OAuth state again and use it
-                    let oauth_state = load_cached_state(uri, name).await.map_err(|e| {
-                        ExtensionError::ConfigError(format!("Failed to load OAuth credentials: {}", e))
-                    })?;
-                    let am = oauth_state.into_authorization_manager().ok_or_else(|| {
-                        ExtensionError::ConfigError("OAuth state has no authorization manager".to_string())
-                    })?;
+                // First check if we have cached OAuth credentials for this extension name
+                // If not found, also check using the URL as the key (allows sharing credentials
+                // across extensions pointing to the same server)
+                let url_key = format!("url_{}", uri.replace("://", "_").replace("/", "_"));
+                let mut cached_oauth = load_cached_state(uri, name).await.ok()
+                    .and_then(|state| state.into_authorization_manager())
+                    .or_else(|| {
+                        // Fall back to URL-keyed credentials
+                        futures::executor::block_on(load_cached_state(uri, &url_key)).ok()
+                            .and_then(|state| state.into_authorization_manager())
+                    });
+
+                // If we found cached credentials, validate them by making a test request
+                // If they're expired/invalid, clear them and run OAuth flow
+                if let Some(ref am) = cached_oauth {
+                    eprintln!("🔐 Found cached OAuth credentials for {}, validating...", name);
+                    match am.get_access_token().await {
+                        Ok(token) => {
+                            // Test the token with a simple request
+                            let test_response = reqwest::Client::new()
+                                .head(uri)
+                                .bearer_auth(&token)
+                                .send()
+                                .await;
+
+                            match test_response {
+                                Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                                    eprintln!("⚠️  Cached OAuth credentials are expired/invalid, clearing...");
+                                    // Clear the bad credentials
+                                    if let Err(e) = crate::oauth::persist::clear_credentials(name) {
+                                        tracing::warn!("Failed to clear expired credentials: {}", e);
+                                    }
+                                    if let Err(e) = crate::oauth::persist::clear_credentials(&url_key) {
+                                        tracing::warn!("Failed to clear URL-keyed expired credentials: {}", e);
+                                    }
+                                    cached_oauth = None;  // Force OAuth flow
+                                }
+                                Ok(_) => {
+                                    eprintln!("✅ Cached OAuth credentials are valid");
+                                }
+                                Err(e) => {
+                                    tracing::debug!("Failed to validate cached credentials: {}", e);
+                                    // Keep cached_oauth - connection might work despite validation failure
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️  Failed to get access token from cached credentials: {}", e);
+                            // Clear potentially corrupted credentials
+                            if let Err(e) = crate::oauth::persist::clear_credentials(name) {
+                                tracing::warn!("Failed to clear corrupted credentials: {}", e);
+                            }
+                            cached_oauth = None;
+                        }
+                    }
+                }
+
+                // If we don't have cached credentials, check if the server requires OAuth
+                // by fetching the OAuth authorization server metadata
+                if cached_oauth.is_none() {
+                    let wellknown_url = format!("{}/.well-known/oauth-authorization-server",
+                        uri.trim_end_matches("/mcp").trim_end_matches('/'));
+
+                    eprintln!("🔍 Checking if server requires OAuth: {}", wellknown_url);
+                    match reqwest::Client::new().head(&wellknown_url).send().await {
+                        Ok(response) => {
+                            eprintln!("📡 OAuth wellknown check returned status: {}", response.status());
+                            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                                || response.status() == reqwest::StatusCode::OK {
+                                // Server requires or supports OAuth, run the flow
+                                eprintln!("⚠️  Server requires OAuth authorization for {}", name);
+                                eprintln!("    A browser window will open. Please authorize the extension.");
+                                eprintln!("    Extension name: {}", name);
+                                match oauth_flow(uri, name).await {
+                                    Ok(am) => {
+                                        cached_oauth = Some(am);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("OAuth flow failed for {}: {}", name, e);
+                                        return Err(ExtensionError::ConfigError(
+                                            format!("OAuth required but authorization failed: {}", e)
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to check OAuth wellknown endpoint: {}", e);
+                        }
+                    }
+                }
+
+                let client: Box<dyn McpClientTrait> = if let Some(am) = cached_oauth {
+                    // Use cached OAuth credentials
                     let auth_client = AuthClient::new(reqwest::Client::default(), am);
                     let transport = StreamableHttpClientTransport::with_client(
                         auth_client,
@@ -340,7 +416,7 @@ impl ExtensionManager {
                         .await?,
                     )
                 } else {
-                    // Try without auth
+                    // No OAuth credentials needed/available, connect without auth
                     let client = reqwest::Client::builder()
                         .default_headers(default_headers)
                         .build()

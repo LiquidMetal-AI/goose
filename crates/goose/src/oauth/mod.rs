@@ -93,6 +93,13 @@ pub async fn oauth_flow(
         warn!("Failed to save credentials: {}", e);
     }
 
+    // Also save credentials using URL as key so different extension names
+    // pointing to the same server can share OAuth credentials
+    let url_key = format!("url_{}", mcp_server_url.replace("://", "_").replace("/", "_"));
+    if let Err(e) = save_credentials(&url_key, &oauth_state).await {
+        warn!("Failed to save URL-keyed credentials: {}", e);
+    }
+
     let auth_manager = oauth_state
         .into_authorization_manager()
         .ok_or_else(|| anyhow::anyhow!("Failed to get authorization manager"))?;

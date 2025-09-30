@@ -3,8 +3,6 @@ use axum::http::{HeaderMap, HeaderName};
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use futures::{future, FutureExt};
-use mcp_core::handler::require_str_parameter;
-use mcp_core::ToolCall;
 use rmcp::service::ClientInitializeError;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{
@@ -27,12 +25,13 @@ use super::extension::{ExtensionConfig, ExtensionError, ExtensionInfo, Extension
 use super::tool_execution::ToolCallResult;
 use crate::agents::extension::{Envs, ProcessExit};
 use crate::agents::extension_malware_check;
+use crate::agents::mcp_client::{McpClient, McpClientTrait};
 use crate::config::{Config, ExtensionConfigManager};
-use crate::oauth::oauth_flow;
+use crate::oauth::{oauth_flow, persist::load_cached_state};
 use crate::prompt_template;
-use mcp_client::client::{McpClient, McpClientTrait};
 use rmcp::model::{
-    Content, ErrorCode, ErrorData, GetPromptResult, Prompt, ResourceContents, ServerInfo, Tool,
+    CallToolRequestParam, Content, ErrorCode, ErrorData, GetPromptResult, Prompt, ResourceContents,
+    ServerInfo, Tool,
 };
 use rmcp::transport::auth::AuthClient;
 use serde_json::Value;
@@ -80,7 +79,7 @@ impl Extension {
     }
 }
 
-/// Manages Goose extensions / MCP clients and their interactions
+/// Manages goose extensions / MCP clients and their interactions
 pub struct ExtensionManager {
     extensions: Mutex<HashMap<String, Extension>>,
 }
@@ -133,6 +132,24 @@ fn normalize(input: String) -> String {
         });
     }
     result.to_lowercase()
+}
+
+fn require_str_parameter<'a>(v: &'a serde_json::Value, name: &str) -> Result<&'a str, ErrorData> {
+    let v = v.get(name).ok_or_else(|| {
+        ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("The parameter {name} is required"),
+            None,
+        )
+    })?;
+    match v.as_str() {
+        Some(r) => Ok(r),
+        None => Err(ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("The parameter {name} must be a string"),
+            None,
+        )),
+    }
 }
 
 pub fn get_parameter_names(tool: &Tool) -> Vec<String> {
@@ -303,36 +320,126 @@ impl ExtensionManager {
                         })?,
                     );
                 }
-                let client = reqwest::Client::builder()
-                    .default_headers(default_headers)
-                    .build()
-                    .map_err(|_| {
-                        ExtensionError::ConfigError("could not construct http client".to_string())
-                    })?;
-                let transport = StreamableHttpClientTransport::with_client(
-                    client,
-                    StreamableHttpClientTransportConfig {
-                        uri: uri.clone().into(),
-                        ..Default::default()
-                    },
-                );
-                let client_res = McpClient::connect(
-                    transport,
-                    Duration::from_secs(
-                        timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
-                    ),
-                )
-                .await;
-                let client = if let Err(e) = client_res {
-                    // make an attempt at oauth, but failing that, return the original error,
-                    // because this might not have been an auth error at all.
-                    // TODO: when rmcp supports it, we should trigger this flow on 401s with
-                    // WWW-Authenticate headers, not just any init error
-                    let am = match oauth_flow(uri, name).await {
-                        Ok(am) => am,
-                        Err(_) => return Err(e.into()),
-                    };
-                    let client = AuthClient::new(reqwest::Client::default(), am);
+
+                // First check if we have cached OAuth credentials for this extension name
+                // If not found, also check using the URL as the key (allows sharing credentials
+                // across extensions pointing to the same server)
+                let url_key = format!("url_{}", uri.replace("://", "_").replace("/", "_"));
+                let mut cached_oauth = load_cached_state(uri, name).await.ok()
+                    .and_then(|state| state.into_authorization_manager())
+                    .or_else(|| {
+                        // Fall back to URL-keyed credentials
+                        futures::executor::block_on(load_cached_state(uri, &url_key)).ok()
+                            .and_then(|state| state.into_authorization_manager())
+                    });
+
+                // If we found cached credentials, validate them by making a test request
+                // If they're expired/invalid, clear them and run OAuth flow
+                if let Some(ref am) = cached_oauth {
+                    eprintln!("🔐 Found cached OAuth credentials for {}, validating...", name);
+                    match am.get_access_token().await {
+                        Ok(token) => {
+                            // Test the token with a simple request
+                            let test_response = reqwest::Client::new()
+                                .head(uri)
+                                .bearer_auth(&token)
+                                .send()
+                                .await;
+
+                            match test_response {
+                                Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                                    eprintln!("⚠️  Cached OAuth credentials are expired/invalid, clearing...");
+                                    // Clear the bad credentials
+                                    if let Err(e) = crate::oauth::persist::clear_credentials(name) {
+                                        tracing::warn!("Failed to clear expired credentials: {}", e);
+                                    }
+                                    if let Err(e) = crate::oauth::persist::clear_credentials(&url_key) {
+                                        tracing::warn!("Failed to clear URL-keyed expired credentials: {}", e);
+                                    }
+                                    cached_oauth = None;  // Force OAuth flow
+                                }
+                                Ok(_) => {
+                                    eprintln!("✅ Cached OAuth credentials are valid");
+                                }
+                                Err(e) => {
+                                    tracing::debug!("Failed to validate cached credentials: {}", e);
+                                    // Keep cached_oauth - connection might work despite validation failure
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️  Failed to get access token from cached credentials: {}", e);
+                            // Clear potentially corrupted credentials
+                            if let Err(e) = crate::oauth::persist::clear_credentials(name) {
+                                tracing::warn!("Failed to clear corrupted credentials: {}", e);
+                            }
+                            cached_oauth = None;
+                        }
+                    }
+                }
+
+                // If we don't have cached credentials, check if the server requires OAuth
+                // by fetching the OAuth authorization server metadata
+                if cached_oauth.is_none() {
+                    let wellknown_url = format!("{}/.well-known/oauth-authorization-server",
+                        uri.trim_end_matches("/mcp").trim_end_matches('/'));
+
+                    eprintln!("🔍 Checking if server requires OAuth: {}", wellknown_url);
+                    match reqwest::Client::new().head(&wellknown_url).send().await {
+                        Ok(response) => {
+                            eprintln!("📡 OAuth wellknown check returned status: {}", response.status());
+                            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                                || response.status() == reqwest::StatusCode::OK {
+                                // Server requires or supports OAuth, run the flow
+                                eprintln!("⚠️  Server requires OAuth authorization for {}", name);
+                                eprintln!("    A browser window will open. Please authorize the extension.");
+                                eprintln!("    Extension name: {}", name);
+                                match oauth_flow(uri, name).await {
+                                    Ok(am) => {
+                                        cached_oauth = Some(am);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("OAuth flow failed for {}: {}", name, e);
+                                        return Err(ExtensionError::ConfigError(
+                                            format!("OAuth required but authorization failed: {}", e)
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to check OAuth wellknown endpoint: {}", e);
+                        }
+                    }
+                }
+
+                let client: Box<dyn McpClientTrait> = if let Some(am) = cached_oauth {
+                    // Use cached OAuth credentials
+                    let auth_client = AuthClient::new(reqwest::Client::default(), am);
+                    let transport = StreamableHttpClientTransport::with_client(
+                        auth_client,
+                        StreamableHttpClientTransportConfig {
+                            uri: uri.clone().into(),
+                            ..Default::default()
+                        },
+                    );
+                    Box::new(
+                        McpClient::connect(
+                            transport,
+                            Duration::from_secs(
+                                timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
+                            ),
+                        )
+                        .await?,
+                    )
+                } else {
+                    // No OAuth credentials needed/available, connect without auth
+                    let client = reqwest::Client::builder()
+                        .default_headers(default_headers)
+                        .build()
+                        .map_err(|_| {
+                            ExtensionError::ConfigError("could not construct http client".to_string())
+                        })?;
                     let transport = StreamableHttpClientTransport::with_client(
                         client,
                         StreamableHttpClientTransportConfig {
@@ -340,17 +447,17 @@ impl ExtensionManager {
                             ..Default::default()
                         },
                     );
-                    McpClient::connect(
-                        transport,
-                        Duration::from_secs(
-                            timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
-                        ),
+                    Box::new(
+                        McpClient::connect(
+                            transport,
+                            Duration::from_secs(
+                                timeout.unwrap_or(crate::config::DEFAULT_EXTENSION_TIMEOUT),
+                            ),
+                        )
+                        .await?,
                     )
-                    .await?
-                } else {
-                    client_res?
                 };
-                Box::new(client)
+                client
             }
             ExtensionConfig::Stdio {
                 cmd,
@@ -604,6 +711,7 @@ impl ExtensionManager {
         cancellation_token: CancellationToken,
     ) -> Result<Vec<Content>, ErrorData> {
         let uri = require_str_parameter(&params, "uri")?;
+
         let extension_name = params.get("extension_name").and_then(|v| v.as_str());
 
         // If extension name is provided, we can just look it up
@@ -805,7 +913,7 @@ impl ExtensionManager {
 
     pub async fn dispatch_tool_call(
         &self,
-        tool_call: ToolCall,
+        tool_call: CallToolRequestParam,
         cancellation_token: CancellationToken,
     ) -> Result<ToolCallResult> {
         // Dispatch tool call based on the prefix naming convention
@@ -1042,10 +1150,9 @@ impl ExtensionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcp_client::client::Error;
-    use mcp_client::client::McpClientTrait;
     use rmcp::model::CallToolResult;
-    use rmcp::model::InitializeResult;
+    use rmcp::model::{InitializeResult, JsonObject};
+    use rmcp::{object, ServiceError as Error};
 
     use rmcp::model::ListPromptsResult;
     use rmcp::model::ListResourcesResult;
@@ -1146,7 +1253,7 @@ mod tests {
         async fn call_tool(
             &self,
             name: &str,
-            _arguments: Value,
+            _arguments: Option<JsonObject>,
             _cancellation_token: CancellationToken,
         ) -> Result<CallToolResult, Error> {
             match name {
@@ -1269,9 +1376,9 @@ mod tests {
             .await;
 
         // verify a normal tool call
-        let tool_call = ToolCall {
-            name: "test_client__tool".to_string(),
-            arguments: json!({}),
+        let tool_call = CallToolRequestParam {
+            name: "test_client__tool".to_string().into(),
+            arguments: Some(object!({})),
         };
 
         let result = extension_manager
@@ -1279,9 +1386,9 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let tool_call = ToolCall {
-            name: "test_client__test__tool".to_string(),
-            arguments: json!({}),
+        let tool_call = CallToolRequestParam {
+            name: "test_client__test__tool".to_string().into(),
+            arguments: Some(object!({})),
         };
 
         let result = extension_manager
@@ -1290,9 +1397,9 @@ mod tests {
         assert!(result.is_ok());
 
         // verify a multiple underscores dispatch
-        let tool_call = ToolCall {
-            name: "__cli__ent____tool".to_string(),
-            arguments: json!({}),
+        let tool_call = CallToolRequestParam {
+            name: "__cli__ent____tool".to_string().into(),
+            arguments: Some(object!({})),
         };
 
         let result = extension_manager
@@ -1301,9 +1408,9 @@ mod tests {
         assert!(result.is_ok());
 
         // Test unicode in tool name, "client 🚀" should become "client_"
-        let tool_call = ToolCall {
-            name: "client___tool".to_string(),
-            arguments: json!({}),
+        let tool_call = CallToolRequestParam {
+            name: "client___tool".to_string().into(),
+            arguments: Some(object!({})),
         };
 
         let result = extension_manager
@@ -1311,9 +1418,9 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let tool_call = ToolCall {
-            name: "client___test__tool".to_string(),
-            arguments: json!({}),
+        let tool_call = CallToolRequestParam {
+            name: "client___test__tool".to_string().into(),
+            arguments: Some(object!({})),
         };
 
         let result = extension_manager
@@ -1322,9 +1429,9 @@ mod tests {
         assert!(result.is_ok());
 
         // this should error out, specifically for an ToolError::ExecutionError
-        let invalid_tool_call = ToolCall {
-            name: "client___tools".to_string(),
-            arguments: json!({}),
+        let invalid_tool_call = CallToolRequestParam {
+            name: "client___tools".to_string().into(),
+            arguments: Some(object!({})),
         };
 
         let result = extension_manager
@@ -1343,9 +1450,9 @@ mod tests {
 
         // this should error out, specifically with an ToolError::NotFound
         // this client doesn't exist
-        let invalid_tool_call = ToolCall {
-            name: "_client__tools".to_string(),
-            arguments: json!({}),
+        let invalid_tool_call = CallToolRequestParam {
+            name: "_client__tools".to_string().into(),
+            arguments: Some(object!({})),
         };
 
         let result = extension_manager
@@ -1427,9 +1534,9 @@ mod tests {
             .await;
 
         // Try to call an unavailable tool
-        let unavailable_tool_call = ToolCall {
-            name: "test_extension__tool".to_string(),
-            arguments: json!({}),
+        let unavailable_tool_call = CallToolRequestParam {
+            name: "test_extension__tool".to_string().into(),
+            arguments: Some(object!({})),
         };
 
         let result = extension_manager
@@ -1446,9 +1553,9 @@ mod tests {
         }
 
         // Try to call an available tool - should succeed
-        let available_tool_call = ToolCall {
-            name: "test_extension__available_tool".to_string(),
-            arguments: json!({}),
+        let available_tool_call = CallToolRequestParam {
+            name: "test_extension__available_tool".to_string().into(),
+            arguments: Some(object!({})),
         };
 
         let result = extension_manager

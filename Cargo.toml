@@ -19,3 +19,4 @@ rmcp = { version = "0.6.2", features = ["schemars", "auth"] }
 # Patch for Windows cross-compilation issue with crunchy
 [patch.crates-io]
 crunchy = { git = "https://github.com/nmathewson/crunchy", branch = "cross-compilation-fix" }
+rmcp = { path = "patches/rmcp" }

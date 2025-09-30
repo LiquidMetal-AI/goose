@@ -13,7 +13,7 @@ use tracing::warn;
 
 use crate::oauth::persist::{clear_credentials, load_cached_state, save_credentials};
 
-mod persist;
+pub mod persist;
 
 const CALLBACK_TEMPLATE: &str = include_str!("oauth_callback.html");
 
@@ -91,6 +91,13 @@ pub async fn oauth_flow(
 
     if let Err(e) = save_credentials(name, &oauth_state).await {
         warn!("Failed to save credentials: {}", e);
+    }
+
+    // Also save credentials using URL as key so different extension names
+    // pointing to the same server can share OAuth credentials
+    let url_key = format!("url_{}", mcp_server_url.replace("://", "_").replace("/", "_"));
+    if let Err(e) = save_credentials(&url_key, &oauth_state).await {
+        warn!("Failed to save URL-keyed credentials: {}", e);
     }
 
     let auth_manager = oauth_state
